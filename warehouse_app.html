@@ -14,6 +14,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.19.1/umd/index.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
 <style>
 :root{
   --bg:#0f1117;--bg2:#181c26;--bg3:#1e2433;--bg4:#252b3d;
@@ -786,64 +787,61 @@ async function startScanner() {
   try { const ctx = new (window.AudioContext||window.webkitAudioContext)(); ctx.resume(); ctx.close(); } catch(e) {}
   switchTab('scanner');
   document.getElementById('scan-status').textContent = 'Εκκίνηση κάμερας...';
+  document.getElementById('scanner-result').innerHTML = '';
   try {
-    // Init ZXing reader
-    const hints = new Map();
-    const formats = [
-      ZXing.BarcodeFormat.EAN_13,
-      ZXing.BarcodeFormat.EAN_8,
-      ZXing.BarcodeFormat.CODE_128,
-      ZXing.BarcodeFormat.CODE_39,
-      ZXing.BarcodeFormat.QR_CODE,
-      ZXing.BarcodeFormat.DATA_MATRIX,
-    ];
-    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, formats);
-    hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
-    zxingReader = new ZXing.BrowserMultiFormatReader(hints);
-
+    scannerStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }
+    });
     const video = document.getElementById('scanner-video');
-    const devices = await ZXing.BrowserCodeReader.listVideoInputDevices();
-    // Prefer back camera
-    const backCam = devices.find(d => d.label.toLowerCase().includes('back') || d.label.toLowerCase().includes('rear') || d.label.toLowerCase().includes('environment')) || devices[devices.length - 1];
-    const deviceId = backCam ? backCam.deviceId : undefined;
-
+    video.srcObject = scannerStream;
+    await video.play();
     scannerActive = true;
+    torchOn = false;
+    setTimeout(() => enableTorch(true), 800);
     document.getElementById('scan-status').textContent = 'Αναζήτηση barcode...';
-
     let lastScanned = '';
     let lastScannedTime = 0;
-
-    zxingReader.decodeFromVideoDevice(deviceId, video, (result, err) => {
-      if (result) {
-        const bc = result.getText();
-        const now = Date.now();
-        // Cooldown: αγνόησε ίδιο barcode για 2.5 δευτερόλεπτα
-        if (bc && bc.length >= 6 && (bc !== lastScanned || now - lastScannedTime > 2500)) {
-          lastScanned = bc;
-          lastScannedTime = now;
-          document.getElementById('scan-status').textContent = 'Βρέθηκε: ' + bc;
-          // Flash green on scan zone
-          const zone = document.getElementById('scan-zone');
-          if(zone) {
-            zone.style.transition = 'all 0.2s';
-            zone.querySelectorAll('div').forEach(d => {
-              if(d.style.borderTop || d.style.borderBottom) {
-                d.style.borderColor = '#2ecc87';
-                setTimeout(()=>d.style.borderColor='#4d7cff', 600);
-              }
-            });
-          }
-          handleBarcode(bc);
-        }
+    function checkBarcode(bc) {
+      const now = Date.now();
+      if (bc && bc.length >= 6 && (bc !== lastScanned || now - lastScannedTime > 2500)) {
+        lastScanned = bc; lastScannedTime = now;
+        document.getElementById('scan-status').textContent = 'Βρέθηκε!';
+        handleBarcode(bc);
       }
-    });
+    }
+    // Try ZXing (EAN13)
+    let useZXing = false;
+    try {
+      if (typeof ZXing !== 'undefined') {
+        const hints = new Map();
+        hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [ZXing.BarcodeFormat.EAN_13, ZXing.BarcodeFormat.EAN_8, ZXing.BarcodeFormat.CODE_128, ZXing.BarcodeFormat.CODE_39, ZXing.BarcodeFormat.QR_CODE]);
+        hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+        zxingReader = new ZXing.BrowserMultiFormatReader(hints);
+        zxingReader.decodeFromVideoElement(video, (result, err) => { if (result && scannerActive) checkBarcode(result.getText()); });
+        useZXing = true;
+      }
+    } catch(e) { useZXing = false; }
+    // Fallback jsQR
+    if (!useZXing && typeof jsQR !== 'undefined') {
+      const canvas = document.getElementById('scanner-canvas');
+      scannerInterval = setInterval(() => {
+        if (!video.videoWidth || !scannerActive) return;
+        canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+        const ctx = canvas.getContext('2d'); ctx.drawImage(video, 0, 0);
+        const code = jsQR(ctx.getImageData(0,0,canvas.width,canvas.height).data, canvas.width, canvas.height);
+        if (code) checkBarcode(code.data);
+      }, 250);
+    }
   } catch(e) {
-    document.getElementById('scanner-result').innerHTML = '<div style="padding:16px;color:var(--red);font-size:13px;text-align:center">Δεν επιτράπηκε η πρόσβαση στην κάμερα.<br><br>Δώσε άδεια κάμερας στο browser.</div>';
+    let msg = 'Δεν επιτράπηκε η πρόσβαση στην κάμερα.';
+    if (e.name==='NotAllowedError') msg = '⚠ Δεν δόθηκε άδεια κάμερας.<br>Πήγαινε <b>Ρυθμίσεις → Απόρρητο → Κάμερα</b> και ενεργοποίησε τον browser.';
+    if (e.name==='NotFoundError') msg = 'Δεν βρέθηκε κάμερα στη συσκευή.';
+    if (e.name==='NotSupportedError') msg = 'Ο browser δεν υποστηρίζει κάμερα.<br>Χρησιμοποίησε <b>Chrome</b>.';
+    document.getElementById('scanner-result').innerHTML = `<div style="padding:20px;color:var(--red);font-size:13px;text-align:center;line-height:2">${msg}<br><br><button onclick="manualBarcode()" style="background:var(--accent);border:none;border-radius:8px;padding:12px 24px;color:#fff;font-size:14px;cursor:pointer;font-family:var(--sans)">Χειροκίνητη εισαγωγή</button></div>`;
     document.getElementById('scan-status').textContent = 'Σφάλμα κάμερας';
   }
 }
-
-function scanFrame() {} // kept for compatibility
+function scanFrame() {}
 
 function handleBarcode(bc) {
   stopScanner();
